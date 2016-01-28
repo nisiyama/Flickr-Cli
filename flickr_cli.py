@@ -3,7 +3,7 @@
 import logging
 import os.path
 import imghdr
-
+import re
 
 def valid_img(f):
     """
@@ -12,6 +12,11 @@ def valid_img(f):
     :param f: str that indicates the file directory.
     :return: boolean
     """
+    if not os.path.isfile(f) :
+        return False
+    if re.search(r'\.(jpg|gif|png|tiff|mp4|mp2|avi|wmv|mov|m4v)$', f,
+                 flags=re.IGNORECASE) :
+        return True
     try:
         file_type = imghdr.what(f)
         supported_types = ['jpeg', 'gif', 'png']
@@ -120,23 +125,33 @@ class Photoset(object):
         :param title:
         :return:
         """
-        self.photoset_id = self.exists(title) or self.create(title)
+        self.photoset_id = self.exists(title)
+        if self.photoset_id :
+            return False
+        self.photoset_id = self.create(title)
+        return True
 
+    def add_photo(self, id) :
+        ret = self.flickr.photosets_addPhoto(photoset_id=self.photoset_id,
+                                             photo_id=id)
+        return ret
+        
     def add_photos(self):
         """Adds photo ids to photoset on Flickr."""
-        return [self.flickr.photosets_addPhoto(
-            photoset_id=self.photoset_id,
-            photo_id=i) for i in self.photo_ids]
+        return [self.add_photo(i) for i in self.photo_ids]
 
     def __call__(self, title, ids, primary_photo_id=0):
         """Generates photoset based on information passed in call"""
+        if len(ids) == 0 :
+            return None
         self.primary_photo_id = primary_photo_id or ids[0]
         self.photo_ids = ids
-        self.photo_ids.remove(self.primary_photo_id)
-        self.get_photoset_id(title)
+        if self.get_photoset_id(title) :
+            self.photo_ids.remove(self.primary_photo_id)
         if self.photo_ids:
             response = self.add_photos()
             return response
+        return None
 
 
 class AbstractDirectoryUpload(object):
@@ -151,12 +166,12 @@ class AbstractDirectoryUpload(object):
         """Return true for files we don't want in our list (directories for now)"""
         return os.path.isdir(os.path.join(d, f))
 
-    def get_directory_contents(self, d):
+    def get_directory_contents(self, d, **kwargs):
         """Get list of all files in a directory.
         TODO: Maybe this is better as a generator?"""
-        self.files = [os.path.join(d, f)
-                      for f in os.listdir(d)
-                      if not self.filter_directory_contents(d, f)]
+        self.files = sorted([os.path.join(d, f)
+                             for f in os.listdir(d)
+                             if not self.filter_directory_contents(d, f)])
 
     def prehook(self, **kwargs):
         pass
@@ -164,19 +179,19 @@ class AbstractDirectoryUpload(object):
     def posthook(self, **kwargs):
         pass
 
-    def upload(self):
+    def upload(self, **kwargs):
         raise NotImplementedError
 
-    def parse_response(self):
+    def parse_response(self, **kwargs):
         raise NotImplementedError
 
     def __call__(self, directory, **kwargs):
         self.directory = directory
 
         self.prehook(**kwargs)
-        self.get_directory_contents(self.directory)
-        self.upload()
-        self.parse_response()
+        self.get_directory_contents(self.directory, **kwargs)
+        self.upload(**kwargs)
+        self.parse_response(**kwargs)
         self.posthook(**kwargs)
 
 
@@ -195,12 +210,23 @@ class DirectoryFlickrUpload(AbstractDirectoryUpload):
         self.create_photoset = Photoset(flickr)
 
     def filter_directory_contents(self, d, f):
-        return not valid_img(os.path.join(d, f))
+        path = os.path.join(d, f)
+        return not valid_img(path)
+
+    def open_output(self, path) :
+        if path != None :
+            try :
+                fd = open(path, 'w', 1)
+                return fd
+            except IOError :
+                pass
+        return None
 
     def prehook(self, tags, pset, **kwargs):
         self.ids = []
         self.tags = ", ".join(tags)
         self.photoset_name = pset
+        self.log = self.open_output(kwargs.get('log'))
 
     def flickr_upload(self, f, **kwargs):
         """
@@ -209,28 +235,49 @@ class DirectoryFlickrUpload(AbstractDirectoryUpload):
         :param kwargs:
         :return:
         """
-        print "Uploading %s" % f
-        return self.flickr.upload(filename=f, tags=self.tags,
-                                  is_public=kwargs.get('is_public', 0),
-                                  is_family=kwargs.get('is_family', 0))
+        self.index += 1
+        print "Uploading %4d/%4d: %s" % (self.index, self.count, f)
+        try :
+            result = self.flickr.upload(filename=f, tags=self.tags,
+                                        is_public=kwargs.get('is_public', 0),
+                                        is_family=kwargs.get('is_family', 0))
+        except Exception as e :
+            print "; upload failed: %s" % e
+            result = None
+        ok = (result != None) and (result.attrib['stat'] == 'ok')
+        if (not ok) and (result != None) :
+            print "; upload failed."
+        if self.log != None :
+            tag = "+" if ok else "-"
+            self.log.write('%s,%s\n' % (tag, f))
+        return result
 
-    def upload(self):
+    def upload(self, **kwargs):
+        self.count = len(self.files)
+        self.index = 0
         self.responses = [(self.flickr_upload(f, is_public=0, is_family=0), f) for f in self.files]
 
-    def parse_response(self):
+    def parse_response(self, **kwargs):
         """
         Handles response from Flickr API.
         :return:
         """
-        self.ids = [r.find("photoid").text for (r, f) in self.responses if r.attrib['stat'] == "ok"]
-        self.failed_uploads = [f for (r, f) in self.responses if r.attrib['stat'] != "ok"]
+        succ_list = [(r, f) for (r, f) in self.responses if (r != None) and (r.attrib['stat'] == "ok")]
+        fail_list = [(r, f) for (r, f) in self.responses if (r == None) or (r.attrib['stat'] != "ok")]
+        self.ids = [r.find("photoid").text for (r, _) in succ_list]
+        self.failed_uploads = [f for (_, f) in fail_list]
         self.successful_uploads_count = len(self.ids)
         self.failed_uploads_count = len(self.failed_uploads)
 
     def posthook(self, **kwargs):
-        self.create_photoset(self.photoset_name, self.ids)
+        try :
+            self.create_photoset(self.photoset_name, self.ids)
+        except Exception as e :
+            print "failed to create photoset %s: %s" % (e, self.photoset_name)
         self.handle_failed_uploads()
-
+        if self.log != None :
+            self.log.close()
+            
     def handle_failed_uploads(self):
         pass
 
@@ -254,3 +301,21 @@ class FamilyDirectoryUpload(DirectoryFlickrUpload):
         :type f: str
         The path to a file."""
         return super(FamilyDirectoryUpload, self).flickr_upload(f, is_public=0, is_family=1)
+
+
+class ArgFilesCollector :
+    """collect files specified as argument."""
+    def get_directory_contents(self, d, **kwargs) :
+        self.files = sorted(kwargs.get('files'))
+
+class DirectoryFilesFlickrUpload(ArgFilesCollector, DirectoryFlickrUpload) :
+    """Uploads specified files in a directory as "private" files."""
+    pass
+        
+class PublicDirectoryFilesUpload(ArgFilesCollector, PublicDirectoryUpload) :
+    """Uploads specified files in a directory as "Public" files."""
+    pass
+        
+class FamilyDirectoryFilesUpload(ArgFilesCollector, FamilyDirectoryUpload) :
+    """Uploads specified files in a directory as "Family-only" files."""
+    pass
